@@ -480,7 +480,12 @@ class AirPodsTracker:
                     if self.paused:
                         time.sleep(0.1)
                         rec_str = " [red][REC][/red]" if record_data else ""
-                        header_text = f"Ctrl C: Stop | p: Pause    [bold red]Paused[/bold red]{rec_str}"
+
+                        left = "AirPods Head Tracking - v1.0.0"
+                        status = "[bold red]Paused[/bold red]"
+                        right = "Ctrl+C - Close | p - Pause"
+                        remaining = max(term_width - len(left) - len(right), 0)
+                        header_text = f"{left}{status.center(remaining)}{right}{rec_str}"
                         layout["header"].update(Panel(header_text, style="bold white on black"))
                         continue
                     
@@ -497,11 +502,16 @@ class AirPodsTracker:
                             latest.get('orientation 3', 0)
                         ]
                         self.orientation_visualizer.add_calibration_sample(sample)
+                        time.sleep(0.05)
                         rec_str = " [red][REC][/red]" if record_data else ""
-                        header_text = f"Ctrl C: Stop | p: Pause    [bold yellow]Calibrating...[/bold yellow]{rec_str}"
+                        
+                        left = "AirPods Head Tracking - v1.0.0"
+                        status = "[bold yellow]Calibrating...[/bold yellow]"
+                        right = "Ctrl+C - Close | p - Pause"
+                        remaining = max(term_width - len(left) - len(right), 0)
+                        header_text = f"{left}{status.center(remaining)}{right}{rec_str}"
                         layout["header"].update(Panel(header_text, style="bold white on black"))
                         live.refresh()
-                        time.sleep(0.05)
                         continue
                     
                     o1 = latest.get('orientation 1', 0)
@@ -524,8 +534,11 @@ class AirPodsTracker:
                     horiz_plot = acp.plot(h_accel, config_acc)
                     
                     rec_str = " [red][REC][/red]" if record_data else ""
-                    status_str = "[bold green]Live[/bold green]" if not self.paused else "[bold red]Paused[/bold red]"
-                    header_text = f"Ctrl C: Stop | p: Pause    {status_str}{rec_str}"
+                    status = "[bold green]Live[/bold green]"
+                    left = "AirPods Head Tracking - v1.0.0"
+                    right = "Ctrl+C - Close | p - Pause"
+                    remaining = max(term_width - len(left) - len(right), 0)
+                    header_text = f"{left}{status.center(remaining)}{right}{rec_str}"
                     layout["header"].update(Panel(header_text, style="bold white on black"))
                     
                     face_art = self.orientation_visualizer.create_face_art(pitch, yaw)
@@ -801,7 +814,6 @@ class AirPodsTracker:
                     self.start_live_plotting(record_data=True, duration=duration)
                 elif cmd == "gestures":
                     from gestures import GestureDetector
-                    # pass existing connection manager if available from AirPodsTracker
                     if self.conn is not None:
                         detector = GestureDetector(conn=self.conn)
                     else:
@@ -831,7 +843,8 @@ class AirPodsTracker:
                 logger.info("Use 'quit' to exit.")
             except EOFError:
                 logger.info("Exiting.")
-                self.disconnect()
+                if self.conn != None:
+                    self.conn.disconnect()
                 break
 
 if __name__ == "__main__":

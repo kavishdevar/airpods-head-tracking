@@ -86,7 +86,7 @@ class HeadOrientation:
         o1_norm = o1 - self.o1_neutral
         o2_norm = o2 - self.o2_neutral
         o3_norm = o3 - self.o3_neutral
-        pitch = (o2_norm + o3_norm) / 2 / 32000 * 180
+        pitch = -(o2_norm + o3_norm) / 2 / 32000 * 180
         yaw = (o2_norm - o3_norm) / 2 / 32000 * 180
         return {'pitch': pitch, 'yaw': yaw}
 
