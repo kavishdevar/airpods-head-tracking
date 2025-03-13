@@ -15,6 +15,7 @@ from rich.console import Console
 import drawille
 from head_orientation import HeadOrientation
 import logging
+from connection_manager import ConnectionManager
 
 class Colors:
     RESET = "\033[0m"
@@ -88,15 +89,16 @@ class AirPodsTracker:
         self.use_terminal = True # '--terminal' in sys.argv
         self.orientation_visualizer = HeadOrientation(use_terminal=self.use_terminal)
 
+        self.conn = None
+
     def connect(self):
         try:
             logger.info("Trying to connect to %s on PSM 0x%04X...", self.bt_addr, self.psm)
-            self.sock = bluetooth.BluetoothSocket(bluetooth.L2CAP)
-            self.sock.connect((self.bt_addr, self.psm))
-            logger.info("Connected.")
-
-            self.sock.send(bytes.fromhex(INIT_CMD))
-            time.sleep(0.1)
+            self.conn = ConnectionManager(self.bt_addr, self.psm, logger=logger)
+            if not self.conn.connect():
+                logger.error("Connection failed via ConnectionManager.")
+                return False
+            self.sock = self.conn.sock
             self.sock.send(bytes.fromhex(NOTIF_CMD))
             logger.info("Sent initialization command.")
 
@@ -107,10 +109,37 @@ class AirPodsTracker:
             logger.error("Connection error: %s", e)
             return False
 
-    def disconnect(self):
-        if self.sock:
-            self.sock.close()
-            logger.info("Disconnected.")
+    def start_tracking(self, duration=None):
+        if not self.recording:
+            self.conn.send_start()
+            filename = "head_tracking_" + datetime.now().strftime("%Y%m%d_%H%M%S") + ".log"
+            self.log_file = open(filename, "w")
+            self.recording = True
+            logger.info("Recording started. Saving data to %s", filename)
+
+            if duration is not None and duration > 0:
+                def auto_stop():
+                    time.sleep(duration)
+                    if self.recording:
+                        self.stop_tracking()
+                        logger.info("Recording automatically stopped after %s seconds.", duration)
+
+                timer_thread = threading.Thread(target=auto_stop, daemon=True)
+                timer_thread.start()
+                logger.info("Will automatically stop recording after %s seconds.", duration)
+        else:
+            logger.info("Already recording.")
+
+    def stop_tracking(self):
+        if self.recording:
+            self.conn.send_stop()
+            self.recording = False
+            if self.log_file is not None:
+                self.log_file.close()
+                self.log_file = None
+            logger.info("Recording stopped.")
+        else:
+            logger.info("Not currently recording.")
 
     def format_hex(self, data):
         hex_str = data.hex()
@@ -224,38 +253,6 @@ class AirPodsTracker:
                 logger.error("Error receiving data: %s", e)
                 break
 
-    def start_tracking(self, duration=None):
-        if not self.recording:
-            self.sock.send(bytes.fromhex(START_CMD))
-            filename = "head_tracking_" + datetime.now().strftime("%Y%m%d_%H%M%S") + ".log"
-            self.log_file = open(filename, "w")
-            self.recording = True
-            logger.info("Recording started. Saving data to %s", filename)
-
-            if duration is not None and duration > 0:
-                def auto_stop():
-                    time.sleep(duration)
-                    if self.recording:
-                        self.stop_tracking()
-                        logger.info("Recording automatically stopped after %s seconds.", duration)
-
-                timer_thread = threading.Thread(target=auto_stop, daemon=True)
-                timer_thread.start()
-                logger.info("Will automatically stop recording after %s seconds.", duration)
-        else:
-            logger.info("Already recording.")
-
-    def stop_tracking(self):
-        if self.recording:
-            self.sock.send(bytes.fromhex(STOP_CMD))
-            self.recording = False
-            if self.log_file is not None:
-                self.log_file.close()
-                self.log_file = None
-            logger.info("Recording stopped.")
-        else:
-            logger.info("Not currently recording.")
-
     def load_log_file(self, filepath):
         self.raw_packets = []
         self.parsed_packets = []
@@ -304,17 +301,20 @@ class AirPodsTracker:
         return values
 
     def is_valid_tracking_packet(self, hex_string):
-        standard_header = "04 00 04 00 17 00 00 00 10 00 45 00"
-
+        standard_header = "04 00 04 00 17 00 00 00 10 00"
+        
         if not hex_string.startswith(standard_header):
-            logger.warning("Invalid packet header: %s", hex_string[:30])
+            if self.live_plotting:
+                logger.warning("Invalid packet header: %s", hex_string[:30])
             return False
 
         if len(hex_string.split()) < 80:
-            logger.warning("Invalid packet length: %s", hex_string[:30])
+            if self.live_plotting:
+                logger.warning("Invalid packet length: %s", hex_string[:30])
             return False
 
         return True
+    
 
     def plot_fields(self, field_names=None):
         if not self.parsed_packets:
@@ -438,6 +438,9 @@ class AirPodsTracker:
         return frame
 
     def _start_live_plotting_terminal(self, record_data=False, duration=None):
+        import sys, select, tty, termios
+        old_settings = termios.tcgetattr(sys.stdin)
+        tty.setcbreak(sys.stdin.fileno()) 
         console = Console()
         term_width = console.width
         plot_width = round(min(term_width / 2 - 15, 120))
@@ -462,13 +465,25 @@ class AirPodsTracker:
                 Layout(name="raw", ratio=1)
             )
             return layout
-
+        
         layout = make_compact_layout()
-
+        
         try:
             import time
             with Live(layout, refresh_per_second=20, screen=True) as live:
                 while True:
+                    if sys.stdin in select.select([sys.stdin], [], [], 0)[0]:
+                        ch = sys.stdin.read(1)
+                        if ch == 'p':
+                            self.paused = not self.paused
+                            logger.info("Paused" if self.paused else "Resumed")
+                    if self.paused:
+                        time.sleep(0.1)
+                        rec_str = " [red][REC][/red]" if record_data else ""
+                        header_text = f"Ctrl C: Stop | p: Pause    [bold red]Paused[/bold red]{rec_str}"
+                        layout["header"].update(Panel(header_text, style="bold white on black"))
+                        continue
+                    
                     with self.data_lock:
                         if len(self.live_data) < 1:
                             continue
@@ -482,18 +497,20 @@ class AirPodsTracker:
                             latest.get('orientation 3', 0)
                         ]
                         self.orientation_visualizer.add_calibration_sample(sample)
-                        layout["header"].update(Panel("[bold white on black]Calibrating... please wait[/]", style="bold white on black"))
+                        rec_str = " [red][REC][/red]" if record_data else ""
+                        header_text = f"Ctrl C: Stop | p: Pause    [bold yellow]Calibrating...[/bold yellow]{rec_str}"
+                        layout["header"].update(Panel(header_text, style="bold white on black"))
                         live.refresh()
                         time.sleep(0.05)
                         continue
-
+                    
                     o1 = latest.get('orientation 1', 0)
                     o2 = latest.get('orientation 2', 0)
                     o3 = latest.get('orientation 3', 0)
                     orientation = self.orientation_visualizer.calculate_orientation(o1, o2, o3)
                     pitch = orientation['pitch']
                     yaw = orientation['yaw']
-
+                    
                     h_accel = [p.get('Horizontal Acceleration', 0) for p in data]
                     v_accel = [p.get('Vertical Acceleration', 0) for p in data]
                     if len(h_accel) > plot_width:
@@ -505,14 +522,13 @@ class AirPodsTracker:
                     config_acc = {'height': 20, 'min': global_min, 'max': global_max}
                     vert_plot = acp.plot(v_accel, config_acc)
                     horiz_plot = acp.plot(h_accel, config_acc)
-                    layout["header"].update(Panel(
-                        "[bold white on black] AirPods Head Tracking [/]" +
-                        (" [red][REC][/]" if record_data else ""),
-                        style="bold white on black"
-                    ))
+                    
+                    rec_str = " [red][REC][/red]" if record_data else ""
+                    status_str = "[bold green]Live[/bold green]" if not self.paused else "[bold red]Paused[/bold red]"
+                    header_text = f"Ctrl C: Stop | p: Pause    {status_str}{rec_str}"
+                    layout["header"].update(Panel(header_text, style="bold white on black"))
                     
                     face_art = self.orientation_visualizer.create_face_art(pitch, yaw)
-                    face_text = f"Pitch: {pitch:.1f}°   Yaw: {yaw:.1f}°\n" + face_art
                     layout["accelerations"]["vertical"].update(Panel(
                         "[bold yellow]Vertical Acceleration[/]\n" +
                         vert_plot + "\n" +
@@ -525,7 +541,7 @@ class AirPodsTracker:
                         f"Cur: {h_accel[-1]:6.1f} | Min: {min(h_accel):6.1f} | Max: {max(h_accel):6.1f}",
                         style="cyan"
                     ))
-                    layout["orientations"]["face"].update(Panel(face_text, title="[green]Orientation - Visualization[/]", style="green"))
+                    layout["orientations"]["face"].update(Panel(face_art, title="[green]Orientation - Visualization[/]", style="green"))
                     
                     o2_values = [p.get('orientation 2', 0) for p in data[-plot_width:]]
                     o3_values = [p.get('orientation 3', 0) for p in data[-plot_width:]]
@@ -552,6 +568,8 @@ class AirPodsTracker:
             else:
                 if self.sock:
                     self.sock.send(bytes.fromhex(STOP_CMD))
+        finally:
+            termios.tcsetattr(sys.stdin, termios.TCSADRAIN, old_settings)
 
     def _start_live_plotting(self, record_data=False, duration=None):
         terminal_width = os.get_terminal_size().columns
@@ -783,11 +801,16 @@ class AirPodsTracker:
                     self.start_live_plotting(record_data=True, duration=duration)
                 elif cmd == "gestures":
                     from gestures import GestureDetector
-                    detector = GestureDetector()
+                    # pass existing connection manager if available from AirPodsTracker
+                    if self.conn is not None:
+                        detector = GestureDetector(conn=self.conn)
+                    else:
+                        detector = GestureDetector()
                     detector.start_detection()
                 elif cmd == "quit":
                     logger.info("Exiting.")
-                    self.disconnect()
+                    if self.conn != None:
+                        self.conn.disconnect()
                     break
                 elif cmd == "help":
                     logger.info("\nAirPods Head Tracking Analyzer")

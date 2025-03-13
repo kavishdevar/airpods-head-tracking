@@ -43,7 +43,7 @@ class GestureDetector:
     START_CMD = "04 00 04 00 17 00 00 00 10 00 10 00 08 A1 02 42 0B 08 0E 10 02 1A 05 01 40 9C 00 00"
     STOP_CMD  = "04 00 04 00 17 00 00 00 10 00 11 00 08 7E 10 02 42 0B 08 4E 10 02 1A 05 01 00 00 00 00"
 
-    def __init__(self):
+    def __init__(self, conn=None):
         self.sock = None
         self.bt_addr = "28:2D:7F:C2:05:5B"
         self.psm = 0x1001
@@ -75,35 +75,78 @@ class GestureDetector:
         self.detection_timeout = 15
         
         self.min_confidence_threshold = 0.7
-                
+        
+        self.conn = conn
+
     def connect(self):
-        """Establish Bluetooth connection with AirPods."""
         try:
             log.info(f"Connecting to AirPods at {self.bt_addr}...")
-            self.sock = bluetooth.BluetoothSocket(bluetooth.L2CAP)
-            self.sock.connect((self.bt_addr, self.psm))
-            log.info(f"{Colors.GREEN}✓ Connected to AirPods{Colors.RESET}")
-            
-            self.sock.send(bytes.fromhex(self.INIT_CMD))
-            log.info(f"{Colors.GREEN}✓ Initialization complete{Colors.RESET}")
-            
+            if self.conn is None:
+                from connection_manager import ConnectionManager
+                self.conn = ConnectionManager(self.bt_addr, self.psm, logger=log)
+                if not self.conn.connect():
+                    return False
+            else:
+                if not self.conn.connected:
+                    if not self.conn.connect():
+                        return False
+            self.sock = self.conn.sock
+            log.info(f"{Colors.GREEN}✓ Connected to AirPods via ConnectionManager{Colors.RESET}")
             return True
         except Exception as e:
             log.error(f"{Colors.RED}Connection failed: {e}{Colors.RESET}")
             return False
     
-    def disconnect(self):
-        """Safely disconnect from AirPods."""
-        if self.sock:
-            try:
-                self.sock.send(bytes.fromhex(self.STOP_CMD))
-                log.info(f"{Colors.GREEN}✓ Head tracking stopped{Colors.RESET}")
-                self.sock.close()
-                log.info(f"{Colors.GREEN}✓ Disconnected from AirPods{Colors.RESET}")
-            except Exception as e:
-                log.error(f"Error during disconnect: {e}")
-            self.sock = None
+    def process_data(self):
+        """Process incoming head tracking data."""
+        self.conn.send_start()
+        log.info(f"{Colors.GREEN}✓ Head tracking activated{Colors.RESET}")
     
+        self.running = True
+        start_time = time.time()
+
+        log.info(f"{Colors.GREEN}Ready! Make a YES or NO gesture{Colors.RESET}")
+        log.info(f"{Colors.YELLOW}Tip: Use natural, moderate speed head movements{Colors.RESET}")
+        
+        while self.running:
+            if time.time() - start_time > self.detection_timeout:
+                log.warning(f"{Colors.YELLOW}⚠️  Detection timeout reached. No gesture detected.{Colors.RESET}")
+                self.running = False
+                break
+                
+            try:
+                if not self.sock:
+                    log.error("Socket not available.")
+                    break
+                data = self.sock.recv(1024)
+                formatted = self.format_hex(data)
+                if self.is_valid_tracking_packet(formatted):
+                    raw_bytes = bytes.fromhex(formatted.replace(" ", ""))
+                    horizontal, vertical = self.extract_orientation_values(raw_bytes)
+                    
+                    if horizontal is not None and vertical is not None:
+                        smooth_h, smooth_v = self.apply_smoothing(horizontal, vertical)
+                        
+                        with self.data_lock:
+                            self.horiz_buffer.append(smooth_h)
+                            self.vert_buffer.append(smooth_v)
+                            
+                            self.detect_peaks_and_troughs()
+                            gesture = self.detect_gestures()
+                            
+                            if gesture:
+                                self.running = False
+                                break
+        
+            except Exception as e:
+                if self.running:
+                    log.error(f"Data processing error: {e}")
+                break
+
+    def disconnect(self):
+        """Disconnect from socket."""
+        self.conn.disconnect()
+
     def format_hex(self, data):
         """Format binary data to readable hex string."""
         hex_str = data.hex()
@@ -248,24 +291,24 @@ class GestureDetector:
         recent = sorted_extremes[-self.required_extremes:]
         
         avg_amplitude = sum(abs(val) for _, val, _ in recent) / len(recent)
-        amplitude_factor = min(1.0, avg_amplitude / 600)  # Lowered from 800 to 600
+        amplitude_factor = min(1.0, avg_amplitude / 600)
         
         rhythm_factor = self.calculate_rhythm_consistency()
         
         signs = [1 if val > 0 else -1 for _, val, _ in recent]
         alternating = all(signs[i] != signs[i-1] for i in range(1, len(signs)))
-        alternation_factor = 1.0 if alternating else 0.5  # Less strict, was 0.3
+        alternation_factor = 1.0 if alternating else 0.5
         
         if is_vertical:
             vert_amp = sum(abs(val) for _, val, _ in recent) / len(recent)
             horiz_vals = list(self.horiz_buffer)[-len(recent)*2:]
             horiz_amp = sum(abs(val) for val in horiz_vals) / len(horiz_vals) if horiz_vals else 0
-            isolation_factor = min(1.0, vert_amp / (horiz_amp + 0.1) * 1.2)  # Boosted by 20%
+            isolation_factor = min(1.0, vert_amp / (horiz_amp + 0.1) * 1.2)
         else:
             horiz_amp = sum(abs(val) for _, val, _ in recent)
             vert_vals = list(self.vert_buffer)[-len(recent)*2:]
             vert_amp = sum(abs(val) for val in vert_vals) / len(vert_vals) if vert_vals else 0
-            isolation_factor = min(1.0, horiz_amp / (vert_amp + 0.1) * 1.2)  # Boosted by 20%
+            isolation_factor = min(1.0, horiz_amp / (vert_amp + 0.1) * 1.2)
         
         confidence = (
             amplitude_factor * 0.4 + 
@@ -302,51 +345,6 @@ class GestureDetector:
         
         return None
     
-    def process_data(self):
-        """Process incoming head tracking data."""
-        self.sock.send(bytes.fromhex(self.START_CMD))
-        log.info(f"{Colors.GREEN}✓ Head tracking activated{Colors.RESET}")
-        
-        self.running = True
-        start_time = time.time()
-        
-
-        log.info(f"{Colors.GREEN}Ready! Make a YES or NO gesture{Colors.RESET}")
-        log.info(f"{Colors.YELLOW}Tip: Use natural, moderate speed head movements{Colors.RESET}")
-        
-        while self.running:
-            if time.time() - start_time > self.detection_timeout:
-                log.warning(f"{Colors.YELLOW}⚠️  Detection timeout reached. No gesture detected.{Colors.RESET}")
-                self.running = False
-                break
-                
-            try:
-                data = self.sock.recv(1024)
-                formatted = self.format_hex(data)
-                
-                if self.is_valid_tracking_packet(formatted):
-                    raw_bytes = bytes.fromhex(formatted.replace(" ", ""))
-                    horizontal, vertical = self.extract_orientation_values(raw_bytes)
-                    
-                    if horizontal is not None and vertical is not None:
-                        smooth_h, smooth_v = self.apply_smoothing(horizontal, vertical)
-                        
-                        with self.data_lock:
-                            self.horiz_buffer.append(smooth_h)
-                            self.vert_buffer.append(smooth_v)
-                            
-                            self.detect_peaks_and_troughs()
-                            gesture = self.detect_gestures()
-                            
-                            if gesture:
-                                self.running = False
-                                break
-                
-            except Exception as e:
-                if self.running:
-                    log.error(f"Data processing error: {e}")
-                break
-    
     def start_detection(self):
         """Begin gesture detection process."""
         log.info(f"{Colors.BOLD}{Colors.WHITE}Starting gesture detection...{Colors.RESET}")
@@ -367,8 +365,8 @@ class GestureDetector:
         except KeyboardInterrupt:
             log.info(f"{Colors.YELLOW}Detection canceled by user.{Colors.RESET}")
             self.running = False
-        
-        self.disconnect()
+        if __name__ == "__main__":
+            self.disconnect()
         log.info(f"{Colors.GREEN}Gesture detection complete.{Colors.RESET}")
 
 if __name__ == "__main__":
