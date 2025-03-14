@@ -480,12 +480,15 @@ class AirPodsTracker:
                     if self.paused:
                         time.sleep(0.1)
                         rec_str = " [red][REC][/red]" if record_data else ""
-
                         left = "AirPods Head Tracking - v1.0.0"
+                        right = "Ctrl+C - Close | p - Pause" + rec_str
                         status = "[bold red]Paused[/bold red]"
-                        right = "Ctrl+C - Close | p - Pause"
-                        remaining = max(term_width - len(left) - len(right), 0)
-                        header_text = f"{left}{status.center(remaining)}{right}{rec_str}"
+                        header = list(" " * term_width)
+                        header[0:len(left)] = list(left)
+                        header[term_width - len(right):] = list(right)
+                        start = (term_width - len(status)) // 2
+                        header[start:start+len(status)] = list(status)
+                        header_text = "".join(header)
                         layout["header"].update(Panel(header_text, style="bold white on black"))
                         continue
                     
@@ -534,11 +537,15 @@ class AirPodsTracker:
                     horiz_plot = acp.plot(h_accel, config_acc)
                     
                     rec_str = " [red][REC][/red]" if record_data else ""
-                    status = "[bold green]Live[/bold green]"
                     left = "AirPods Head Tracking - v1.0.0"
-                    right = "Ctrl+C - Close | p - Pause"
-                    remaining = max(term_width - len(left) - len(right), 0)
-                    header_text = f"{left}{status.center(remaining)}{right}{rec_str}"
+                    right = "Ctrl+C - Close | p - Pause" + rec_str
+                    status = "[bold green]Live[/bold green]"
+                    header = list(" " * term_width)
+                    header[0:len(left)] = list(left)
+                    header[term_width - len(right):] = list(right)
+                    start = (term_width - len(status)) // 2
+                    header[start:start+len(status)] = list(status)
+                    header_text = "".join(header)
                     layout["header"].update(Panel(header_text, style="bold white on black"))
                     
                     face_art = self.orientation_visualizer.create_face_art(pitch, yaw)
